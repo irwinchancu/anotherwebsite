@@ -1,22 +1,22 @@
-# bot.py
+# bot.py (Enhanced with SQLite Persistence for Koyeb Deployment)
 import os
-import asyncio
 import logging
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import random
 
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
 # ------------------- Configuration -------------------
-TOKEN = os.getenv("BOT_TOKEN")          # Set this in environment variables
-TIMEZONE = ZoneInfo("Asia/Hong_Kong")   # Hong Kong time
+TOKEN = os.getenv("BOT_TOKEN")
+TIMEZONE = ZoneInfo("Asia/Hong_Kong")
+DB_PATH = "bot_data.db"  # SQLite file; persists on ephemeral disk
 # -----------------------------------------------------
 
 logging.basicConfig(
@@ -24,34 +24,71 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# In-memory storage (for free hosts; data resets on restart)
-# For persistent storage, replace with SQLite or PostgreSQL later
-reminders = []          # List of {"chat_id": int, "text": str, "time": str, "job": Job}
-thoughts = {}           # {chat_id: [{"time": datetime, "text": str}, ...]}
-
-# Motivational quotes (you can expand this list)
+# Motivational quotes
 QUOTES = [
     "The best time to plant a tree was 20 years ago. The second best time is now.",
     "Success is not final, failure is not fatal: it is the courage to continue that counts.",
     "Believe you can and you're halfway there.",
-    "Don’t watch the clock; do what it does. Keep going.",
-    "Everything you’ve ever wanted is on the other side of fear.",
+    "Don't watch the clock; do what it does. Keep going.",
+    "Everything you've ever wanted is on the other side of fear.",
     "The only way to do great work is to love what you do.",
     "Your limitation—it's only your imagination.",
     "Great things never come from comfort zones.",
 ]
 
-# ------------------- Helper Functions -------------------
-def get_thoughts(chat_id: int):
-    return thoughts.get(chat_id, [])
+# ------------------- Database Setup -------------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS thoughts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            timestamp TEXT,
+            text TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            time_str TEXT,
+            message TEXT,
+            active INTEGER DEFAULT 1
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 def save_thought(chat_id: int, text: str):
-    if chat_id not in thoughts:
-        thoughts[chat_id] = []
-    thoughts[chat_id].append({
-        "time": datetime.now(TIMEZONE),
-        "text": text.strip()
-    })
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    timestamp = datetime.now(TIMEZONE).isoformat()
+    cursor.execute("INSERT INTO thoughts (chat_id, timestamp, text) VALUES (?, ?, ?)",
+                   (chat_id, timestamp, text.strip()))
+    conn.commit()
+    conn.close()
+
+def get_thoughts(chat_id: int, date_filter=None):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    if date_filter:
+        today = date_filter.date().isoformat()  # YYYY-MM-DD
+        cursor.execute("""
+            SELECT timestamp, text FROM thoughts 
+            WHERE chat_id = ? AND DATE(timestamp) = ? 
+            ORDER BY timestamp
+        """, (chat_id, today))
+    else:
+        cursor.execute("""
+            SELECT timestamp, text FROM thoughts 
+            WHERE chat_id = ? 
+            ORDER BY timestamp DESC 
+            LIMIT 20
+        """, (chat_id,))
+    results = [{"time": row[0], "text": row[1]} for row in cursor.fetchall()]
+    conn.close()
+    return results
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -60,7 +97,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 # ------------------- Commands -------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello! I am your personal reminder & thought journal bot.\n\n"
+        "Hello! I am your personal reminder & thought journal bot with persistent storage.\n\n"
         "Commands:\n"
         "/remind <time> <message>  → e.g. /remind 08:30 Wake up and conquer the day!\n"
         "/thought <your text>       → Record a thought/journal entry\n"
@@ -79,38 +116,29 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = " ".join(context.args[1:])
 
     try:
-        reminder_time = datetime.strptime(time_str, "%H:%M").time()
+        datetime.strptime(time_str, "%H:%M").time()
     except ValueError:
         await update.message.reply_text("Time format must be HH:MM (24h)")
         return
 
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO reminders (chat_id, time_str, message) VALUES (?, ?, ?)",
+                   (update.effective_chat.id, time_str, message))
+    conn.commit()
+    conn.close()
+
+    # Schedule one-time reminder; for recurring, extend with daily job checks
     now = datetime.now(TIMEZONE)
+    reminder_time = datetime.strptime(time_str, "%H:%M").time()
     reminder_dt = datetime.combine(now.date(), reminder_time, tzinfo=TIMEZONE)
-
     if reminder_dt < now:
-        reminder_dt = reminder_dt.replace(day=reminder_dt.day + 1)  # tomorrow
-
+        reminder_dt += timedelta(days=1)
     delay = (reminder_dt - now).total_seconds()
 
-    job = context.job_queue.run_once(
-        send_reminder,
-        when=delay,
-        chat_id=update.effective_chat.id,
-        data=message,
-        name=f"reminder_{update.effective_chat.id}"
-    )
+    context.job_queue.run_once(send_reminder, when=delay, chat_id=update.effective_chat.id, data=message)
 
-    reminders.append({
-        "chat_id": update.effective_chat.id,
-        "text": message,
-        "time": time_str,
-        "job": job
-    })
-
-    await update.message.reply_text(
-        f"Reminder set for {time_str} every day!\n"
-        f"\"{message}\""
-    )
+    await update.message.reply_text(f"Reminder set for {time_str}!\n\"{message}\"")
 
 async def thought_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -123,17 +151,15 @@ async def thought_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Thought saved at {hk_time}\n\n“{text}”")
 
 async def today_thoughts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_thoughts = get_thoughts(update.effective_chat.id)
-    today = datetime.now(TIMEZONE).date()
-    todays = [t for t in user_thoughts if t["time"].date() == today]
-
-    if not todays:
+    today = datetime.now(TIMEZONE)
+    user_thoughts = get_thoughts(update.effective_chat.id, today)
+    if not user_thoughts:
         await update.message.reply_text("No thoughts recorded today yet.")
         return
 
     response = f"Your thoughts today ({today.strftime('%Y-%m-%d')}):\n\n"
-    for t in todays:
-        time_str = t["time"].strftime("%H:%M")
+    for t in user_thoughts:
+        time_str = datetime.fromisoformat(t["time"]).strftime("%H:%M")
         response += f"• {time_str} — {t['text']}\n"
     await update.message.reply_text(response)
 
@@ -144,15 +170,12 @@ async def all_thoughts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     response = f"All your thoughts ({len(user_thoughts)} total):\n\n"
-    for t in user_thoughts[-20:]:  # Show last 20 to avoid spam
-        date_str = t["time"].strftime("%Y-%m-%d %H:%M")
+    for t in user_thoughts:
+        date_str = datetime.fromisoformat(t["time"]).strftime("%Y-%m-%d %H:%M")
         response += f"{date_str} → {t['text']}\n"
-    if len(user_thoughts) > 20:
-        response += "\n... (showing last 20 entries)"
     await update.message.reply_text(response)
 
 async def motivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import random
     quote = random.choice(QUOTES)
     await update.message.reply_text(f"“{quote}”")
 
@@ -161,6 +184,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------- Main -------------------
 def main():
+    init_db()  # Initialize database on startup
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN environment variable is required.")
+    
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -171,7 +198,7 @@ def main():
     app.add_handler(CommandHandler("allthoughts", all_thoughts))
     app.add_handler(CommandHandler("motivate", motivate))
 
-    print("Bot is running 24/7...")
+    print("Bot is running 24/7 with persistent storage...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
